@@ -6,8 +6,8 @@ const {
     REST,
     Routes,
     SlashCommandBuilder,
-    PermissionsBitField,
     EmbedBuilder,
+    PermissionFlagsBits,
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle
@@ -16,84 +16,232 @@ const {
 const fs = require("fs");
 const path = require("path");
 
+// ============================================================
+// CONFIG
+// ============================================================
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 
-if (!TOKEN) throw new Error("DISCORD_TOKEN is missing.");
-if (!CLIENT_ID) throw new Error("CLIENT_ID is missing.");
+if (!TOKEN) {
+    console.error("Missing DISCORD_TOKEN in .env");
+    process.exit(1);
+}
 
-const client = new Client({
-    intents: [GatewayIntentBits.Guilds]
-});
+if (!CLIENT_ID) {
+    console.error("Missing CLIENT_ID in .env");
+    process.exit(1);
+}
 
 const DATA_FILE = path.join(__dirname, "motionbot-data.json");
 
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds
+    ]
+});
+
+// ============================================================
+// DATA
+// ============================================================
+
 let data = {
-    servers: {},
     warnings: {},
-    challenges: {}
+    challenges: {},
+    events: {},
+    settings: {}
 };
 
 try {
     if (fs.existsSync(DATA_FILE)) {
-        const saved = JSON.parse(
-            fs.readFileSync(DATA_FILE, "utf8")
-        );
+        const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 
         data = {
-            ...data,
-            ...saved
+            warnings: parsed.warnings || {},
+            challenges: parsed.challenges || {},
+            events: parsed.events || {},
+            settings: parsed.settings || {}
         };
     }
 } catch (error) {
-    console.error("Database load error:", error.message);
+    console.error("Failed to load data:", error.message);
 }
 
 let saveTimer = null;
 
 function saveData() {
-    clearTimeout(saveTimer);
+    if (saveTimer) return;
 
     saveTimer = setTimeout(() => {
+        saveTimer = null;
+
         try {
             fs.writeFileSync(
                 DATA_FILE,
-                JSON.stringify(data, null, 2)
+                JSON.stringify(data, null, 2),
+                "utf8"
             );
         } catch (error) {
-            console.error(
-                "Database save error:",
-                error.message
-            );
+            console.error("Failed to save data:", error.message);
         }
-    }, 1000);
+    }, 1500);
 }
 
-function getServer(id) {
-    if (!data.servers[id]) {
-        data.servers[id] = {
-            eventLevel: null
-        };
+// ============================================================
+// HELPERS
+// ============================================================
 
-        saveData();
+function truncate(text, length = 1000) {
+    if (!text) return "None";
+    text = String(text);
+
+    if (text.length <= length) return text;
+
+    return text.slice(0, length - 3) + "...";
+}
+
+function formatDuration(seconds) {
+    seconds = Math.floor(seconds);
+
+    const days = Math.floor(seconds / 86400);
+    seconds %= 86400;
+
+    const hours = Math.floor(seconds / 3600);
+    seconds %= 3600;
+
+    const minutes = Math.floor(seconds / 60);
+    seconds %= 60;
+
+    const parts = [];
+
+    if (days) parts.push(`${days}d`);
+    if (hours) parts.push(`${hours}h`);
+    if (minutes) parts.push(`${minutes}m`);
+    parts.push(`${seconds}s`);
+
+    return parts.join(" ");
+}
+
+function safeUserName(user) {
+    return user.globalName || user.username;
+}
+
+function getWarnings(guildId, userId) {
+    if (!data.warnings[guildId]) {
+        data.warnings[guildId] = {};
     }
 
-    return data.servers[id];
+    if (!data.warnings[guildId][userId]) {
+        data.warnings[guildId][userId] = [];
+    }
+
+    return data.warnings[guildId][userId];
 }
 
-/* =========================
-   GD API CACHE
-========================= */
+function randomItem(array) {
+    return array[Math.floor(Math.random() * array.length)];
+}
 
-const GD_API = "https://gdbrowser.com/api";
+function difficultyEmoji(difficulty) {
+    const value = String(difficulty || "").toLowerCase();
+
+    if (value.includes("easy")) return "🟢";
+    if (value.includes("normal")) return "🔵";
+    if (value.includes("harder")) return "🟠";
+    if (value === "hard") return "🟡";
+    if (value.includes("insane")) return "🔴";
+    if (value.includes("demon")) return "😈";
+    if (value.includes("auto")) return "⚪";
+
+    return "⚫";
+}
+
+function difficultyName(level) {
+    if (!level) return "Unknown";
+
+    if (level.difficulty) return level.difficulty;
+
+    if (level.difficultyFace) {
+        return level.difficultyFace;
+    }
+
+    return "Unknown";
+}
+
+function levelUrl(id) {
+    return `https://gdbrowser.com/${id}`;
+}
+
+// ============================================================
+// GEOMETRY DASH API
+// ============================================================
+//
+// GDBrowser does not require an API key.
+// However, it can return 403 from hosting providers/datacenter IPs.
+//
+// We therefore:
+// 1. Cache successful responses.
+// 2. Cache failures briefly.
+// 3. Retry through the secondary public API.
+// 4. Never spam Wispbyte with requests.
+// ============================================================
+
+const GD_BROWSER_API = "https://gdbrowser.com/api";
+const GD_ALT_API = "https://gd-level-api.liamt.xyz";
+
+const GD_CACHE_TIME = 60 * 1000;
+const GD_FAILURE_CACHE_TIME = 15 * 1000;
+const GD_TIMEOUT = 7000;
 
 const gdCache = new Map();
+const gdFailureCache = new Map();
 
-const GD_CACHE_TIME = 30000;
-const GD_TIMEOUT = 8000;
+let gdbrowserBlocked = false;
+let gdbrowserBlockedUntil = 0;
 
-async function gdFetch(endpoint) {
-    const cached = gdCache.get(endpoint);
+async function fetchJSON(url, options = {}) {
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+        controller.abort();
+    }, GD_TIMEOUT);
+
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal,
+            headers: {
+                "User-Agent": "MotionBOT/3.0 Discord Bot",
+                "Accept": "application/json",
+                ...(options.headers || {})
+            }
+        });
+
+        const text = await response.text();
+
+        if (!response.ok) {
+            const error = new Error(`HTTP ${response.status}`);
+            error.status = response.status;
+            error.body = text;
+            throw error;
+        }
+
+        if (!text || text.trim() === "-1") {
+            return null;
+        }
+
+        try {
+            return JSON.parse(text);
+        } catch {
+            return null;
+        }
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function gdbrowserFetch(endpoint) {
+    const cached = gdCache.get(`gdb:${endpoint}`);
 
     if (
         cached &&
@@ -102,276 +250,466 @@ async function gdFetch(endpoint) {
         return cached.data;
     }
 
-    const controller = new AbortController();
+    const failure = gdFailureCache.get(`gdb:${endpoint}`);
 
-    const timeout = setTimeout(
-        () => controller.abort(),
-        GD_TIMEOUT
-    );
+    if (
+        failure &&
+        Date.now() - failure < GD_FAILURE_CACHE_TIME
+    ) {
+        return null;
+    }
+
+    if (gdbrowserBlocked && Date.now() < gdbrowserBlockedUntil) {
+        return null;
+    }
 
     try {
-        const response = await fetch(
-            `${GD_API}${endpoint}`,
-            {
-                signal: controller.signal,
-                headers: {
-                    "User-Agent":
-                        "MotionBOT/2.0"
-                }
-            }
+        const result = await fetchJSON(
+            `${GD_BROWSER_API}${endpoint}`
         );
 
-        if (!response.ok) {
-            throw new Error(
-                `HTTP ${response.status}`
+        if (result !== null) {
+            gdCache.set(`gdb:${endpoint}`, {
+                data: result,
+                time: Date.now()
+            });
+
+            return result;
+        }
+
+        return null;
+    } catch (error) {
+        if (error.status === 403) {
+            gdbrowserBlocked = true;
+            gdbrowserBlockedUntil =
+                Date.now() + 5 * 60 * 1000;
+
+            console.warn(
+                "GDBrowser returned 403. Temporarily disabling direct GDBrowser requests."
             );
         }
 
-        const text = await response.text();
-
-        if (!text || text.trim() === "-1") {
-            return null;
-        }
-
-        let result;
-
-        try {
-            result = JSON.parse(text);
-        } catch {
-            return null;
-        }
-
-        gdCache.set(endpoint, {
-            data: result,
-            time: Date.now()
-        });
-
-        return result;
-
-    } catch (error) {
-        console.error(
-            `GD API error: ${endpoint}`,
-            error.message
+        gdFailureCache.set(
+            `gdb:${endpoint}`,
+            Date.now()
         );
 
         return null;
-
-    } finally {
-        clearTimeout(timeout);
     }
 }
 
-/* =========================
-   HELPERS
-========================= */
+// ============================================================
+// ALTERNATIVE GD API
+// ============================================================
+//
+// The alternate API is intentionally isolated here.
+// If it is unavailable, the bot simply falls back to GDBrowser.
+// ============================================================
 
-function number(value) {
-    return Number(value || 0).toLocaleString();
+async function alternateGDRequest(url) {
+    const key = `alt:${url}`;
+
+    const cached = gdCache.get(key);
+
+    if (
+        cached &&
+        Date.now() - cached.time < GD_CACHE_TIME
+    ) {
+        return cached.data;
+    }
+
+    const failure = gdFailureCache.get(key);
+
+    if (
+        failure &&
+        Date.now() - failure < GD_FAILURE_CACHE_TIME
+    ) {
+        return null;
+    }
+
+    try {
+        const result = await fetchJSON(url);
+
+        if (result !== null) {
+            gdCache.set(key, {
+                data: result,
+                time: Date.now()
+            });
+
+            return result;
+        }
+
+        return null;
+    } catch (error) {
+        gdFailureCache.set(key, Date.now());
+
+        console.warn(
+            `Alternative GD API failed: ${url} (${error.message})`
+        );
+
+        return null;
+    }
 }
 
-function gdColor(difficulty = "") {
-    const d = difficulty.toLowerCase();
+// ============================================================
+// GD LEVEL
+// ============================================================
 
-    if (d.includes("extreme")) return 0xE74C3C;
-    if (d.includes("insane demon")) return 0x9B59B6;
-    if (d.includes("hard demon")) return 0xE67E22;
-    if (d.includes("medium demon")) return 0xF1C40F;
-    if (d.includes("easy demon")) return 0x2ECC71;
-    if (d.includes("demon")) return 0xFF5555;
-    if (d.includes("insane")) return 0x8E44AD;
-    if (d.includes("harder")) return 0xF39C12;
-    if (d.includes("hard")) return 0xE67E22;
-    if (d.includes("normal")) return 0x3498DB;
-    if (d.includes("easy")) return 0x2ECC71;
+async function getGDLevel(id) {
+    const gdb = await gdbrowserFetch(
+        `/level/${encodeURIComponent(id)}`
+    );
 
-    return 0x5865F2;
+    if (gdb) return gdb;
+
+    // Alternate API fallback.
+    const alternateUrls = [
+        `${GD_ALT_API}/level/${encodeURIComponent(id)}`,
+        `${GD_ALT_API}/levels/${encodeURIComponent(id)}`
+    ];
+
+    for (const url of alternateUrls) {
+        const result = await alternateGDRequest(url);
+
+        if (result) {
+            return result;
+        }
+    }
+
+    return null;
 }
 
-function levelEmbed(level, title) {
-    if (!level) return null;
+// ============================================================
+// GD SEARCH
+// ============================================================
 
-    const description =
-        level.description &&
-        level.description !== "(No description provided)"
-            ? level.description.slice(0, 900)
-            : "No description provided.";
+async function searchGDLevels(query, options = {}) {
+    const count = options.count || 10;
+    const difficulty = options.difficulty;
+
+    let endpoint =
+        `/search/${encodeURIComponent(query || "*")}?count=${count}`;
+
+    if (difficulty !== undefined) {
+        endpoint += `&diff=${encodeURIComponent(difficulty)}`;
+    }
+
+    const gdb = await gdbrowserFetch(endpoint);
+
+    if (Array.isArray(gdb)) {
+        return gdb;
+    }
+
+    if (gdb && Array.isArray(gdb.levels)) {
+        return gdb.levels;
+    }
+
+    // Alternate API attempts.
+    const queryString =
+        `?query=${encodeURIComponent(query || "")}&limit=${count}`;
+
+    const alternateUrls = [
+        `${GD_ALT_API}/search${queryString}`,
+        `${GD_ALT_API}/levels/search${queryString}`
+    ];
+
+    for (const url of alternateUrls) {
+        const result = await alternateGDRequest(url);
+
+        if (Array.isArray(result)) {
+            return result;
+        }
+
+        if (result && Array.isArray(result.levels)) {
+            return result.levels;
+        }
+
+        if (result && Array.isArray(result.data)) {
+            return result.data;
+        }
+    }
+
+    return [];
+}
+
+// ============================================================
+// GD PROFILE
+// ============================================================
+
+async function getGDProfile(username) {
+    const endpoint =
+        `/profile/${encodeURIComponent(username)}`;
+
+    const gdb = await gdbrowserFetch(endpoint);
+
+    if (gdb) {
+        return gdb;
+    }
+
+    const alternateUrls = [
+        `${GD_ALT_API}/profile/${encodeURIComponent(username)}`,
+        `${GD_ALT_API}/user/${encodeURIComponent(username)}`,
+        `${GD_ALT_API}/users/${encodeURIComponent(username)}`
+    ];
+
+    for (const url of alternateUrls) {
+        const result = await alternateGDRequest(url);
+
+        if (result) {
+            return result;
+        }
+    }
+
+    return null;
+}
+
+// ============================================================
+// GD DAILY / WEEKLY
+// ============================================================
+
+async function getSpecialGDLevel(type) {
+    const endpoint =
+        type === "daily"
+            ? "/level/daily"
+            : "/level/weekly";
+
+    const gdb = await gdbrowserFetch(endpoint);
+
+    if (gdb) {
+        return gdb;
+    }
+
+    const alternateUrls = [
+        `${GD_ALT_API}/${type}`,
+        `${GD_ALT_API}/level/${type}`,
+        `${GD_ALT_API}/levels/${type}`
+    ];
+
+    for (const url of alternateUrls) {
+        const result = await alternateGDRequest(url);
+
+        if (result) {
+            return result;
+        }
+    }
+
+    return null;
+}
+
+// ============================================================
+// GD SEARCH HELPERS
+// ============================================================
+
+async function getGDCategory(category) {
+    let endpoint;
+
+    switch (category) {
+        case "featured":
+            endpoint = "/search/featured?count=20";
+            break;
+
+        case "trending":
+            endpoint = "/search/trending?count=20";
+            break;
+
+        case "recent":
+            endpoint = "/search/recent?count=20";
+            break;
+
+        case "demon":
+            endpoint = "/search/*?count=20&diff=-2";
+            break;
+
+        default:
+            endpoint = "/search/*?count=20";
+            break;
+    }
+
+    const result = await gdbrowserFetch(endpoint);
+
+    if (Array.isArray(result)) {
+        return result;
+    }
+
+    if (result && Array.isArray(result.levels)) {
+        return result.levels;
+    }
+
+    return [];
+}
+
+// ============================================================
+// EMBEDS
+// ============================================================
+
+function createLevelEmbed(level, titlePrefix = "") {
+    const id = level.id || level.levelID || level.ID || "Unknown";
+    const name = level.name || "Unknown Level";
+    const author =
+        level.author ||
+        level.creator ||
+        level.creatorName ||
+        "Unknown";
+
+    const difficulty = difficultyName(level);
 
     const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
         .setTitle(
-            title || `🎮 ${level.name}`
+            `${titlePrefix ? titlePrefix + " " : ""}${name}`
         )
-        .setURL(
-            `https://gdbrowser.com/${level.id}`
-        )
-        .setDescription(description)
-        .setColor(
-            gdColor(level.difficulty)
+        .setURL(levelUrl(id))
+        .setDescription(
+            `${difficultyEmoji(difficulty)} **${difficulty}**`
         )
         .addFields(
             {
-                name: "Difficulty",
-                value:
-                    level.difficulty ||
-                    "Unknown",
-                inline: true
-            },
-            {
-                name: "Length",
-                value:
-                    level.length ||
-                    "Unknown",
-                inline: true
-            },
-            {
-                name: "Stars",
-                value: number(level.stars),
-                inline: true
-            },
-            {
-                name: "Downloads",
-                value: number(level.downloads),
-                inline: true
-            },
-            {
-                name: "Likes",
-                value: number(level.likes),
-                inline: true
-            },
-            {
-                name: "Objects",
-                value: number(level.objects),
+                name: "Level ID",
+                value: `\`${id}\``,
                 inline: true
             },
             {
                 name: "Creator",
-                value:
-                    level.author ||
-                    "Unknown",
+                value: truncate(author, 100),
                 inline: true
             },
             {
-                name: "Song",
-                value:
-                    level.songName ||
-                    "Unknown",
+                name: "Stars",
+                value: String(level.stars ?? 0),
                 inline: true
             },
             {
-                name: "Level ID",
-                value: `\`${level.id}\``,
+                name: "Downloads",
+                value: String(level.downloads ?? 0),
+                inline: true
+            },
+            {
+                name: "Likes",
+                value: String(level.likes ?? 0),
+                inline: true
+            },
+            {
+                name: "Length",
+                value: String(level.length || "Unknown"),
                 inline: true
             }
-        )
-        .setFooter({
-            text:
-                "Geometry Dash • MotionBOT"
-        });
+        );
 
-    if (level.featured) {
+    if (level.coins !== undefined) {
         embed.addFields({
-            name: "Rating",
-            value:
-                level.epic
-                    ? "✨ Epic"
-                    : "⭐ Featured",
+            name: "Coins",
+            value: String(level.coins),
             inline: true
         });
     }
 
+    if (level.objects !== undefined) {
+        embed.addFields({
+            name: "Objects",
+            value: String(level.objects),
+            inline: true
+        });
+    }
+
+    if (level.songName) {
+        embed.addFields({
+            name: "Song",
+            value: truncate(
+                `${level.songName}${level.songAuthor ? ` — ${level.songAuthor}` : ""}`,
+                100
+            ),
+            inline: false
+        });
+    }
+
+    if (level.description) {
+        embed.addFields({
+            name: "Description",
+            value: truncate(level.description, 900),
+            inline: false
+        });
+    }
+
+    embed.setFooter({
+        text: `MotionBOT • Geometry Dash • ${id}`
+    });
+
     return embed;
 }
 
-async function permission(
-    interaction,
-    flag,
-    name
-) {
-    if (
-        !interaction.member.permissions.has(flag)
-    ) {
-        await interaction.reply({
-            content:
-                `You need **${name}**.`,
-            ephemeral: true
+function gdUnavailableEmbed() {
+    return new EmbedBuilder()
+        .setColor(0xED4245)
+        .setTitle("Geometry Dash service unavailable")
+        .setDescription(
+            "The Geometry Dash data service rejected or failed the request.\n\n" +
+            "This is usually temporary. No API key is required."
+        )
+        .setFooter({
+            text: "MotionBOT"
         });
-
-        return false;
-    }
-
-    return true;
 }
 
-/* =========================
-   COMMANDS
-========================= */
+// ============================================================
+// COMMANDS
+// ============================================================
 
 const commands = [
+
     new SlashCommandBuilder()
         .setName("help")
-        .setDescription(
-            "Show MotionBOT commands"
-        ),
+        .setDescription("Show all MotionBOT commands"),
 
     new SlashCommandBuilder()
         .setName("ping")
-        .setDescription(
-            "Check bot latency"
-        ),
+        .setDescription("Check bot latency"),
 
     new SlashCommandBuilder()
         .setName("botinfo")
-        .setDescription(
-            "Show bot information"
-        ),
+        .setDescription("Show MotionBOT information"),
 
     new SlashCommandBuilder()
         .setName("uptime")
-        .setDescription(
-            "Show bot uptime"
-        ),
+        .setDescription("Show bot uptime"),
 
     new SlashCommandBuilder()
         .setName("serverinfo")
-        .setDescription(
-            "Show server information"
-        ),
+        .setDescription("Show server information"),
 
     new SlashCommandBuilder()
         .setName("userinfo")
-        .setDescription(
-            "Show user information"
-        )
-        .addUserOption(o =>
-            o.setName("user")
-                .setDescription("User")
+        .setDescription("Show user information")
+        .addUserOption(option =>
+            option
+                .setName("user")
+                .setDescription("User to inspect")
+                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName("avatar")
-        .setDescription(
-            "Show a user's avatar"
-        )
-        .addUserOption(o =>
-            o.setName("user")
+        .setDescription("Show a user's avatar")
+        .addUserOption(option =>
+            option
+                .setName("user")
                 .setDescription("User")
+                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName("membercount")
-        .setDescription(
-            "Show member count"
-        ),
+        .setDescription("Show server member count"),
 
     new SlashCommandBuilder()
         .setName("clear")
-        .setDescription(
-            "Delete messages"
+        .setDescription("Delete messages")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ManageMessages.toString()
         )
-        .addIntegerOption(o =>
-            o.setName("amount")
-                .setDescription(
-                    "Number of messages"
-                )
+        .addIntegerOption(option =>
+            option
+                .setName("amount")
+                .setDescription("Number of messages")
                 .setMinValue(1)
                 .setMaxValue(100)
                 .setRequired(true)
@@ -379,58 +717,71 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("kick")
-        .setDescription(
-            "Kick a member"
+        .setDescription("Kick a member")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.KickMembers.toString()
         )
-        .addUserOption(o =>
-            o.setName("user")
+        .addUserOption(option =>
+            option
+                .setName("user")
                 .setDescription("Member")
                 .setRequired(true)
         )
-        .addStringOption(o =>
-            o.setName("reason")
+        .addStringOption(option =>
+            option
+                .setName("reason")
                 .setDescription("Reason")
+                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName("ban")
-        .setDescription(
-            "Ban a member"
+        .setDescription("Ban a member")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.BanMembers.toString()
         )
-        .addUserOption(o =>
-            o.setName("user")
+        .addUserOption(option =>
+            option
+                .setName("user")
                 .setDescription("Member")
                 .setRequired(true)
         )
-        .addStringOption(o =>
-            o.setName("reason")
+        .addStringOption(option =>
+            option
+                .setName("reason")
                 .setDescription("Reason")
+                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName("unban")
-        .setDescription(
-            "Unban a user"
+        .setDescription("Unban a user")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.BanMembers.toString()
         )
-        .addStringOption(o =>
-            o.setName("userid")
+        .addStringOption(option =>
+            option
+                .setName("userid")
                 .setDescription("User ID")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("timeout")
-        .setDescription(
-            "Timeout a member"
+        .setDescription("Timeout a member")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ModerateMembers.toString()
         )
-        .addUserOption(o =>
-            o.setName("user")
+        .addUserOption(option =>
+            option
+                .setName("user")
                 .setDescription("Member")
                 .setRequired(true)
         )
-        .addIntegerOption(o =>
-            o.setName("minutes")
-                .setDescription("Minutes")
+        .addIntegerOption(option =>
+            option
+                .setName("minutes")
+                .setDescription("Timeout duration")
                 .setMinValue(1)
                 .setMaxValue(40320)
                 .setRequired(true)
@@ -438,48 +789,55 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("untimeout")
-        .setDescription(
-            "Remove a timeout"
+        .setDescription("Remove a timeout")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ModerateMembers.toString()
         )
-        .addUserOption(o =>
-            o.setName("user")
+        .addUserOption(option =>
+            option
+                .setName("user")
                 .setDescription("Member")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("warn")
-        .setDescription(
-            "Warn a member"
+        .setDescription("Warn a member")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ModerateMembers.toString()
         )
-        .addUserOption(o =>
-            o.setName("user")
+        .addUserOption(option =>
+            option
+                .setName("user")
                 .setDescription("Member")
                 .setRequired(true)
         )
-        .addStringOption(o =>
-            o.setName("reason")
+        .addStringOption(option =>
+            option
+                .setName("reason")
                 .setDescription("Reason")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("warnings")
-        .setDescription(
-            "View warnings"
-        )
-        .addUserOption(o =>
-            o.setName("user")
-                .setDescription("User")
+        .setDescription("Show warnings")
+        .addUserOption(option =>
+            option
+                .setName("user")
+                .setDescription("Member")
+                .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("slowmode")
-        .setDescription(
-            "Set channel slowmode"
+        .setDescription("Set channel slowmode")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ManageChannels.toString()
         )
-        .addIntegerOption(o =>
-            o.setName("seconds")
+        .addIntegerOption(option =>
+            option
+                .setName("seconds")
                 .setDescription("Seconds")
                 .setMinValue(0)
                 .setMaxValue(21600)
@@ -488,1808 +846,1637 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("lock")
-        .setDescription(
-            "Lock current channel"
+        .setDescription("Lock the current channel")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ManageChannels.toString()
         ),
 
     new SlashCommandBuilder()
         .setName("unlock")
-        .setDescription(
-            "Unlock current channel"
+        .setDescription("Unlock the current channel")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ManageChannels.toString()
         ),
 
     new SlashCommandBuilder()
         .setName("poll")
-        .setDescription(
-            "Create a poll"
-        )
-        .addStringOption(o =>
-            o.setName("question")
-                .setDescription("Question")
+        .setDescription("Create a yes/no poll")
+        .addStringOption(option =>
+            option
+                .setName("question")
+                .setDescription("Poll question")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("roll")
-        .setDescription(
-            "Roll a number"
-        )
-        .addIntegerOption(o =>
-            o.setName("max")
-                .setDescription("Maximum")
+        .setDescription("Roll a dice")
+        .addIntegerOption(option =>
+            option
+                .setName("sides")
+                .setDescription("Number of sides")
                 .setMinValue(2)
-                .setMaxValue(1000000)
+                .setMaxValue(1000)
+                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName("coinflip")
-        .setDescription(
-            "Flip a coin"
-        ),
+        .setDescription("Flip a coin"),
 
     new SlashCommandBuilder()
         .setName("8ball")
-        .setDescription(
-            "Ask the magic 8-ball"
-        )
-        .addStringOption(o =>
-            o.setName("question")
+        .setDescription("Ask the magic 8-ball")
+        .addStringOption(option =>
+            option
+                .setName("question")
                 .setDescription("Question")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("choose")
-        .setDescription(
-            "Choose between options"
-        )
-        .addStringOption(o =>
-            o.setName("options")
-                .setDescription(
-                    "Separate choices with commas"
-                )
+        .setDescription("Choose between options")
+        .addStringOption(option =>
+            option
+                .setName("options")
+                .setDescription("Separate options with commas")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("rate")
-        .setDescription(
-            "Rate something"
-        )
-        .addStringOption(o =>
-            o.setName("thing")
-                .setDescription("Thing")
+        .setDescription("Rate something")
+        .addStringOption(option =>
+            option
+                .setName("thing")
+                .setDescription("Thing to rate")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("ship")
-        .setDescription(
-            "Calculate compatibility"
-        )
-        .addUserOption(o =>
-            o.setName("user1")
+        .setDescription("Ship two users")
+        .addUserOption(option =>
+            option
+                .setName("user1")
                 .setDescription("First user")
                 .setRequired(true)
         )
-        .addUserOption(o =>
-            o.setName("user2")
+        .addUserOption(option =>
+            option
+                .setName("user2")
                 .setDescription("Second user")
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName("announce")
-        .setDescription(
-            "Create an announcement"
+        .setDescription("Send an announcement")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.ManageMessages.toString()
         )
-        .addStringOption(o =>
-            o.setName("message")
-                .setDescription("Message")
+        .addStringOption(option =>
+            option
+                .setName("message")
+                .setDescription("Announcement")
                 .setRequired(true)
         ),
 
+    // ========================================================
+    // GD
+    // ========================================================
+
     new SlashCommandBuilder()
         .setName("gd")
-        .setDescription(
-            "Geometry Dash tools"
-        )
+        .setDescription("Geometry Dash tools")
 
-        .addSubcommand(s =>
-            s.setName("level")
-                .setDescription(
-                    "Look up a level"
-                )
-                .addStringOption(o =>
-                    o.setName("id")
-                        .setDescription(
-                            "Level ID"
-                        )
+        .addSubcommand(sub =>
+            sub
+                .setName("level")
+                .setDescription("Get a Geometry Dash level")
+                .addStringOption(option =>
+                    option
+                        .setName("id")
+                        .setDescription("Level ID")
                         .setRequired(true)
                 )
         )
 
-        .addSubcommand(s =>
-            s.setName("search")
-                .setDescription(
-                    "Search levels"
-                )
-                .addStringOption(o =>
-                    o.setName("query")
-                        .setDescription(
-                            "Level name"
-                        )
+        .addSubcommand(sub =>
+            sub
+                .setName("search")
+                .setDescription("Search Geometry Dash levels")
+                .addStringOption(option =>
+                    option
+                        .setName("query")
+                        .setDescription("Level name")
                         .setRequired(true)
                 )
         )
 
-        .addSubcommand(s =>
-            s.setName("random")
-                .setDescription(
-                    "Generate a random level"
-                )
-                .addStringOption(o =>
-                    o.setName("difficulty")
-                        .setDescription(
-                            "Difficulty"
-                        )
-                        .addChoices(
-                            {
-                                name: "Any",
-                                value: "any"
-                            },
-                            {
-                                name: "Easy",
-                                value: "easy"
-                            },
-                            {
-                                name: "Normal",
-                                value: "normal"
-                            },
-                            {
-                                name: "Hard",
-                                value: "hard"
-                            },
-                            {
-                                name: "Harder",
-                                value: "harder"
-                            },
-                            {
-                                name: "Insane",
-                                value: "insane"
-                            },
-                            {
-                                name: "Demon",
-                                value: "demon"
-                            }
-                        )
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("random")
+                .setDescription("Find a random level")
         )
 
-        .addSubcommand(s =>
-            s.setName("daily")
-                .setDescription(
-                    "Current Daily level"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("daily")
+                .setDescription("Show the current daily level")
         )
 
-        .addSubcommand(s =>
-            s.setName("weekly")
-                .setDescription(
-                    "Current Weekly Demon"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("weekly")
+                .setDescription("Show the current weekly demon")
         )
 
-        .addSubcommand(s =>
-            s.setName("featured")
-                .setDescription(
-                    "Random Featured level"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("featured")
+                .setDescription("Show featured levels")
         )
 
-        .addSubcommand(s =>
-            s.setName("trending")
-                .setDescription(
-                    "Random Trending level"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("trending")
+                .setDescription("Show trending levels")
         )
 
-        .addSubcommand(s =>
-            s.setName("recent")
-                .setDescription(
-                    "Random Recent level"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("recent")
+                .setDescription("Show recent levels")
         )
 
-        .addSubcommand(s =>
-            s.setName("demon")
-                .setDescription(
-                    "Random Demon"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("demon")
+                .setDescription("Find demon levels")
         )
 
-        .addSubcommand(s =>
-            s.setName("profile")
-                .setDescription(
-                    "GD profile"
-                )
-                .addStringOption(o =>
-                    o.setName("username")
-                        .setDescription(
-                            "Username"
-                        )
+        .addSubcommand(sub =>
+            sub
+                .setName("profile")
+                .setDescription("Look up a Geometry Dash profile")
+                .addStringOption(option =>
+                    option
+                        .setName("username")
+                        .setDescription("Username")
                         .setRequired(true)
                 )
         )
 
-        .addSubcommand(s =>
-            s.setName("challenge")
-                .setDescription(
-                    "Server GD challenge"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("challenge")
+                .setDescription("Show the server GD challenge")
         )
 
-        .addSubcommand(s =>
-            s.setName("setchallenge")
-                .setDescription(
-                    "Set server GD challenge"
+        .addSubcommand(sub =>
+            sub
+                .setName("setchallenge")
+                .setDescription("Set the server GD challenge")
+                .setDefaultMemberPermissions(
+                    PermissionFlagsBits.ManageGuild.toString()
                 )
-                .addStringOption(o =>
-                    o.setName("id")
-                        .setDescription(
-                            "Level ID"
-                        )
+                .addStringOption(option =>
+                    option
+                        .setName("level")
+                        .setDescription("Level ID or name")
                         .setRequired(true)
                 )
         )
 
-        .addSubcommand(s =>
-            s.setName("event")
-                .setDescription(
-                    "Server Event Level"
-                )
+        .addSubcommand(sub =>
+            sub
+                .setName("event")
+                .setDescription("Show the current GD event")
         )
 
-        .addSubcommand(s =>
-            s.setName("setevent")
-                .setDescription(
-                    "Set server Event Level"
+        .addSubcommand(sub =>
+            sub
+                .setName("setevent")
+                .setDescription("Set the server GD event")
+                .setDefaultMemberPermissions(
+                    PermissionFlagsBits.ManageGuild.toString()
                 )
-                .addStringOption(o =>
-                    o.setName("id")
-                        .setDescription(
-                            "Level ID"
-                        )
+                .addStringOption(option =>
+                    option
+                        .setName("event")
+                        .setDescription("Event name")
                         .setRequired(true)
                 )
         )
-].map(c => c.toJSON());
+];
 
-/* =========================
-   COMMAND REGISTRATION
-========================= */
+// ============================================================
+// REGISTER COMMANDS
+// ============================================================
 
 async function registerCommands() {
     const rest = new REST({
         version: "10"
     }).setToken(TOKEN);
 
-    await rest.put(
-        Routes.applicationCommands(
-            CLIENT_ID
-        ),
-        {
-            body: commands
-        }
+    try {
+        await rest.put(
+            Routes.applicationCommands(CLIENT_ID),
+            {
+                body: commands.map(command =>
+                    command.toJSON()
+                )
+            }
+        );
+
+        console.log(
+            `Registered ${commands.length} global slash commands.`
+        );
+    } catch (error) {
+        console.error(
+            "Failed to register commands:",
+            error.message
+        );
+    }
+}
+
+// ============================================================
+// READY
+// ============================================================
+
+client.once("clientReady", async () => {
+    console.log(
+        `Logged in as ${client.user.tag}`
     );
 
     console.log(
-        `Registered ${commands.length} global commands.`
+        `Serving ${client.guilds.cache.size} server(s).`
     );
-}
 
-/* =========================
-   READY
-========================= */
+    await registerCommands();
+});
 
-client.once(
-    "clientReady",
-    readyClient => {
-        console.log(
-            `MotionBOT online as ${readyClient.user.tag}`
-        );
+// ============================================================
+// COMMAND HANDLER
+// ============================================================
 
-        readyClient.user.setActivity(
-            "/help"
-        );
-    }
-);
+client.on("interactionCreate", async interaction => {
+    try {
 
-/* =========================
-   INTERACTIONS
-========================= */
+        // ====================================================
+        // BUTTONS
+        // ====================================================
 
-client.on(
-    "interactionCreate",
-    async interaction => {
-
-        if (
-            !interaction.isChatInputCommand()
-        ) return;
-
-        try {
-
-            const name =
-                interaction.commandName;
-
-            /* GENERAL */
-
-            if (name === "help") {
-                return interaction.reply({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setTitle(
-                                "MotionBOT"
-                            )
-                            .setDescription(
-                                "Discord utilities, moderation and Geometry Dash tools."
-                            )
-                            .setColor(
-                                0x5865F2
-                            )
-                            .addFields(
-                                {
-                                    name:
-                                        "General",
-                                    value:
-                                        "`/ping` `/botinfo` `/uptime`\n" +
-                                        "`/serverinfo` `/userinfo` `/avatar`\n" +
-                                        "`/membercount`"
-                                },
-                                {
-                                    name:
-                                        "Moderation",
-                                    value:
-                                        "`/clear` `/kick` `/ban` `/unban`\n" +
-                                        "`/timeout` `/untimeout` `/warn`\n" +
-                                        "`/warnings` `/slowmode` `/lock` `/unlock`"
-                                },
-                                {
-                                    name:
-                                        "Fun",
-                                    value:
-                                        "`/poll` `/roll` `/coinflip`\n" +
-                                        "`/8ball` `/choose` `/rate` `/ship`"
-                                },
-                                {
-                                    name:
-                                        "Geometry Dash",
-                                    value:
-                                        "`/gd level` `/gd search` `/gd random`\n" +
-                                        "`/gd daily` `/gd weekly` `/gd featured`\n" +
-                                        "`/gd trending` `/gd recent` `/gd demon`\n" +
-                                        "`/gd profile` `/gd challenge` `/gd event`"
-                                }
-                            )
-                    ]
-                });
-            }
-
-            if (name === "ping") {
-                return interaction.reply(
-                    `🏓 **${client.ws.ping}ms**`
-                );
-            }
-
-            if (name === "botinfo") {
-                return interaction.reply({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setTitle(
-                                "MotionBOT"
-                            )
-                            .setDescription(
-                                "Lightweight Discord + Geometry Dash bot."
-                            )
-                            .setColor(
-                                0x5865F2
-                            )
-                            .addFields(
-                                {
-                                    name:
-                                        "Servers",
-                                    value:
-                                        `${client.guilds.cache.size}`,
-                                    inline: true
-                                },
-                                {
-                                    name:
-                                        "Commands",
-                                    value:
-                                        `${commands.length}`,
-                                    inline: true
-                                },
-                                {
-                                    name:
-                                        "Memory",
-                                    value:
-                                        `${Math.round(
-                                            process.memoryUsage()
-                                                .rss /
-                                            1024 /
-                                            1024
-                                        )} MB`,
-                                    inline: true
-                                }
-                            )
-                    ]
-                });
-            }
-
-            if (name === "uptime") {
-                const seconds =
-                    Math.floor(
-                        process.uptime()
-                    );
-
-                const days =
-                    Math.floor(
-                        seconds / 86400
-                    );
-
-                const hours =
-                    Math.floor(
-                        (seconds % 86400) /
-                        3600
-                    );
-
-                const minutes =
-                    Math.floor(
-                        (seconds % 3600) /
-                        60
-                    );
-
-                const secs =
-                    seconds % 60;
-
-                return interaction.reply(
-                    `⏱️ \`${days}d ${hours}h ${minutes}m ${secs}s\``
-                );
-            }
-
-            if (name === "serverinfo") {
-                const guild =
-                    interaction.guild;
-
-                return interaction.reply({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setTitle(
-                                guild.name
-                            )
-                            .setColor(
-                                0x5865F2
-                            )
-                            .addFields(
-                                {
-                                    name:
-                                        "Members",
-                                    value:
-                                        number(
-                                            guild.memberCount
-                                        ),
-                                    inline: true
-                                },
-                                {
-                                    name:
-                                        "Channels",
-                                    value:
-                                        number(
-                                            guild.channels.cache.size
-                                        ),
-                                    inline: true
-                                },
-                                {
-                                    name:
-                                        "Roles",
-                                    value:
-                                        number(
-                                            guild.roles.cache.size
-                                        ),
-                                    inline: true
-                                },
-                                {
-                                    name:
-                                        "Owner",
-                                    value:
-                                        `<@${guild.ownerId}>`,
-                                    inline: true
-                                },
-                                {
-                                    name:
-                                        "Server ID",
-                                    value:
-                                        `\`${guild.id}\``,
-                                    inline: true
-                                }
-                            )
-                    ]
-                });
-            }
+        if (interaction.isButton()) {
 
             if (
-                name === "userinfo" ||
-                name === "avatar"
+                interaction.customId === "poll_yes" ||
+                interaction.customId === "poll_no"
             ) {
-                const user =
-                    interaction.options.getUser(
-                        "user"
-                    ) ||
-                    interaction.user;
+                await interaction.reply({
+                    content:
+                        interaction.customId === "poll_yes"
+                            ? "You voted **Yes**."
+                            : "You voted **No**.",
+                    ephemeral: true
+                });
 
-                if (
-                    name === "avatar"
-                ) {
-                    const avatar =
-                        user.displayAvatarURL({
-                            size: 1024
-                        });
+                return;
+            }
 
-                    return interaction.reply({
+            return;
+        }
+
+        if (!interaction.isChatInputCommand()) {
+            return;
+        }
+
+        // ====================================================
+        // BASIC
+        // ====================================================
+
+        if (interaction.commandName === "help") {
+
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle("MotionBOT")
+                .setDescription(
+                    "A compact multipurpose Discord bot with Geometry Dash tools."
+                )
+                .addFields(
+                    {
+                        name: "Information",
+                        value:
+                            "`/ping`\n" +
+                            "`/botinfo`\n" +
+                            "`/uptime`\n" +
+                            "`/serverinfo`\n" +
+                            "`/userinfo`\n" +
+                            "`/avatar`\n" +
+                            "`/membercount`"
+                    },
+                    {
+                        name: "Moderation",
+                        value:
+                            "`/clear`\n" +
+                            "`/kick`\n" +
+                            "`/ban`\n" +
+                            "`/unban`\n" +
+                            "`/timeout`\n" +
+                            "`/untimeout`\n" +
+                            "`/warn`\n" +
+                            "`/warnings`\n" +
+                            "`/slowmode`\n" +
+                            "`/lock`\n" +
+                            "`/unlock`"
+                    },
+                    {
+                        name: "Fun",
+                        value:
+                            "`/poll`\n" +
+                            "`/roll`\n" +
+                            "`/coinflip`\n" +
+                            "`/8ball`\n" +
+                            "`/choose`\n" +
+                            "`/rate`\n" +
+                            "`/ship`"
+                    },
+                    {
+                        name: "Geometry Dash",
+                        value:
+                            "`/gd level`\n" +
+                            "`/gd search`\n" +
+                            "`/gd random`\n" +
+                            "`/gd daily`\n" +
+                            "`/gd weekly`\n" +
+                            "`/gd featured`\n" +
+                            "`/gd trending`\n" +
+                            "`/gd recent`\n" +
+                            "`/gd demon`\n" +
+                            "`/gd profile`\n" +
+                            "`/gd challenge`\n" +
+                            "`/gd event`"
+                    }
+                )
+                .setFooter({
+                    text: "MotionBOT"
+                });
+
+            await interaction.reply({
+                embeds: [embed]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "ping") {
+
+            const sent = await interaction.reply({
+                content: "Calculating...",
+                fetchReply: true
+            });
+
+            const latency =
+                sent.createdTimestamp -
+                interaction.createdTimestamp;
+
+            await interaction.editReply(
+                `🏓 **Pong!** ${latency}ms\n` +
+                `WebSocket: ${client.ws.ping}ms`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "botinfo") {
+
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle("MotionBOT")
+                .addFields(
+                    {
+                        name: "Servers",
+                        value: String(
+                            client.guilds.cache.size
+                        ),
+                        inline: true
+                    },
+                    {
+                        name: "Users",
+                        value: String(
+                            client.guilds.cache.reduce(
+                                (total, guild) =>
+                                    total + (guild.memberCount || 0),
+                                0
+                            )
+                        ),
+                        inline: true
+                    },
+                    {
+                        name: "Uptime",
+                        value: formatDuration(
+                            process.uptime()
+                        ),
+                        inline: true
+                    },
+                    {
+                        name: "Node.js",
+                        value: process.version,
+                        inline: true
+                    },
+                    {
+                        name: "discord.js",
+                        value: "v14",
+                        inline: true
+                    }
+                );
+
+            await interaction.reply({
+                embeds: [embed]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "uptime") {
+
+            await interaction.reply(
+                `⏱️ Uptime: **${formatDuration(process.uptime())}**`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "serverinfo") {
+
+            const guild = interaction.guild;
+
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle(guild.name)
+                .addFields(
+                    {
+                        name: "Owner",
+                        value: `<@${guild.ownerId}>`,
+                        inline: true
+                    },
+                    {
+                        name: "Members",
+                        value: String(guild.memberCount),
+                        inline: true
+                    },
+                    {
+                        name: "Channels",
+                        value: String(
+                            guild.channels.cache.size
+                        ),
+                        inline: true
+                    },
+                    {
+                        name: "Created",
+                        value:
+                            `<t:${Math.floor(
+                                guild.createdTimestamp / 1000
+                            )}:F>`,
+                        inline: false
+                    }
+                );
+
+            if (guild.iconURL()) {
+                embed.setThumbnail(
+                    guild.iconURL({
+                        size: 256
+                    })
+                );
+            }
+
+            await interaction.reply({
+                embeds: [embed]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "userinfo") {
+
+            const user =
+                interaction.options.getUser("user") ||
+                interaction.user;
+
+            const member =
+                interaction.guild.members.cache.get(
+                    user.id
+                );
+
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle(safeUserName(user))
+                .setThumbnail(
+                    user.displayAvatarURL({
+                        size: 512
+                    })
+                )
+                .addFields(
+                    {
+                        name: "Username",
+                        value: `\`${user.tag}\``,
+                        inline: true
+                    },
+                    {
+                        name: "User ID",
+                        value: `\`${user.id}\``,
+                        inline: true
+                    },
+                    {
+                        name: "Bot",
+                        value: user.bot ? "Yes" : "No",
+                        inline: true
+                    }
+                );
+
+            if (member) {
+                embed.addFields({
+                    name: "Joined Server",
+                    value:
+                        member.joinedTimestamp
+                            ? `<t:${Math.floor(
+                                member.joinedTimestamp / 1000
+                            )}:F>`
+                            : "Unknown",
+                    inline: false
+                });
+            }
+
+            await interaction.reply({
+                embeds: [embed]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "avatar") {
+
+            const user =
+                interaction.options.getUser("user") ||
+                interaction.user;
+
+            await interaction.reply({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle(`${safeUserName(user)}'s Avatar`)
+                        .setImage(
+                            user.displayAvatarURL({
+                                size: 1024
+                            })
+                        )
+                ]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "membercount") {
+
+            await interaction.reply(
+                `👥 This server has **${interaction.guild.memberCount}** members.`
+            );
+
+            return;
+        }
+
+        // ====================================================
+        // MODERATION
+        // ====================================================
+
+        if (interaction.commandName === "clear") {
+
+            const amount =
+                interaction.options.getInteger("amount");
+
+            const messages =
+                await interaction.channel.bulkDelete(
+                    amount,
+                    true
+                );
+
+            await interaction.reply({
+                content:
+                    `🧹 Deleted **${messages.size}** messages.`,
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "kick") {
+
+            const user =
+                interaction.options.getUser("user");
+
+            const reason =
+                interaction.options.getString("reason") ||
+                "No reason provided.";
+
+            const member =
+                interaction.guild.members.cache.get(
+                    user.id
+                );
+
+            if (!member) {
+                await interaction.reply({
+                    content: "That member is not in this server.",
+                    ephemeral: true
+                });
+                return;
+            }
+
+            if (!member.kickable) {
+                await interaction.reply({
+                    content:
+                        "I cannot kick that member. Check my role hierarchy and permissions.",
+                    ephemeral: true
+                });
+                return;
+            }
+
+            await member.kick(reason);
+
+            await interaction.reply(
+                `👢 Kicked **${safeUserName(user)}**.\nReason: ${reason}`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "ban") {
+
+            const user =
+                interaction.options.getUser("user");
+
+            const reason =
+                interaction.options.getString("reason") ||
+                "No reason provided.";
+
+            const member =
+                interaction.guild.members.cache.get(
+                    user.id
+                );
+
+            if (member && !member.bannable) {
+                await interaction.reply({
+                    content:
+                        "I cannot ban that member. Check my role hierarchy and permissions.",
+                    ephemeral: true
+                });
+                return;
+            }
+
+            await interaction.guild.members.ban(
+                user.id,
+                {
+                    reason
+                }
+            );
+
+            await interaction.reply(
+                `🔨 Banned **${safeUserName(user)}**.\nReason: ${reason}`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "unban") {
+
+            const userId =
+                interaction.options.getString("userid");
+
+            await interaction.guild.members.unban(
+                userId
+            );
+
+            await interaction.reply(
+                `Unbanned **${userId}**.`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "timeout") {
+
+            const user =
+                interaction.options.getUser("user");
+
+            const minutes =
+                interaction.options.getInteger("minutes");
+
+            const member =
+                interaction.guild.members.cache.get(
+                    user.id
+                );
+
+            if (!member) {
+                await interaction.reply({
+                    content: "Member not found.",
+                    ephemeral: true
+                });
+                return;
+            }
+
+            await member.timeout(
+                minutes * 60 * 1000,
+                `Timeout by ${interaction.user.tag}`
+            );
+
+            await interaction.reply(
+                `⏳ Timed out **${safeUserName(user)}** for **${minutes} minutes**.`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "untimeout") {
+
+            const user =
+                interaction.options.getUser("user");
+
+            const member =
+                interaction.guild.members.cache.get(
+                    user.id
+                );
+
+            if (!member) {
+                await interaction.reply({
+                    content: "Member not found.",
+                    ephemeral: true
+                });
+                return;
+            }
+
+            await member.timeout(null);
+
+            await interaction.reply(
+                `Removed timeout from **${safeUserName(user)}**.`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "warn") {
+
+            const user =
+                interaction.options.getUser("user");
+
+            const reason =
+                interaction.options.getString("reason");
+
+            const warnings =
+                getWarnings(
+                    interaction.guild.id,
+                    user.id
+                );
+
+            warnings.push({
+                reason,
+                moderator: interaction.user.id,
+                timestamp: Date.now()
+            });
+
+            saveData();
+
+            await interaction.reply(
+                `⚠️ Warned **${safeUserName(user)}**.\nReason: ${reason}\nWarnings: **${warnings.length}**`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "warnings") {
+
+            const user =
+                interaction.options.getUser("user");
+
+            const warnings =
+                getWarnings(
+                    interaction.guild.id,
+                    user.id
+                );
+
+            if (!warnings.length) {
+                await interaction.reply(
+                    `**${safeUserName(user)}** has no warnings.`
+                );
+                return;
+            }
+
+            const description =
+                warnings
+                    .slice(-10)
+                    .map(
+                        (warning, index) =>
+                            `**${index + 1}.** ${truncate(
+                                warning.reason,
+                                150
+                            )}\n` +
+                            `Moderator: <@${warning.moderator}>`
+                    )
+                    .join("\n\n");
+
+            await interaction.reply({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor(0xFEE75C)
+                        .setTitle(
+                            `Warnings — ${safeUserName(user)}`
+                        )
+                        .setDescription(description)
+                        .setFooter({
+                            text: `${warnings.length} total warning(s)`
+                        })
+                ]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "slowmode") {
+
+            const seconds =
+                interaction.options.getInteger("seconds");
+
+            await interaction.channel.setRateLimitPerUser(
+                seconds
+            );
+
+            await interaction.reply(
+                `🐌 Slowmode set to **${seconds} seconds**.`
+            );
+
+            return;
+        }
+
+        if (
+            interaction.commandName === "lock" ||
+            interaction.commandName === "unlock"
+        ) {
+
+            const locked =
+                interaction.commandName === "lock";
+
+            await interaction.channel.permissionOverwrites.edit(
+                interaction.guild.roles.everyone,
+                {
+                    SendMessages: !locked
+                }
+            );
+
+            await interaction.reply(
+                locked
+                    ? "🔒 Channel locked."
+                    : "🔓 Channel unlocked."
+            );
+
+            return;
+        }
+
+        // ====================================================
+        // FUN
+        // ====================================================
+
+        if (interaction.commandName === "poll") {
+
+            const question =
+                interaction.options.getString("question");
+
+            const row =
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId("poll_yes")
+                        .setLabel("Yes")
+                        .setStyle(ButtonStyle.Success),
+
+                    new ButtonBuilder()
+                        .setCustomId("poll_no")
+                        .setLabel("No")
+                        .setStyle(ButtonStyle.Danger)
+                );
+
+            await interaction.reply({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle("Poll")
+                        .setDescription(
+                            `**${question}**`
+                        )
+                        .setFooter({
+                            text:
+                                `Poll created by ${safeUserName(interaction.user)}`
+                        })
+                ],
+                components: [row]
+            });
+
+            return;
+        }
+
+        if (interaction.commandName === "roll") {
+
+            const sides =
+                interaction.options.getInteger("sides") || 6;
+
+            const result =
+                Math.floor(
+                    Math.random() * sides
+                ) + 1;
+
+            await interaction.reply(
+                `🎲 You rolled **${result}** on a d${sides}.`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "coinflip") {
+
+            await interaction.reply(
+                Math.random() < 0.5
+                    ? "🪙 **Heads**"
+                    : "🪙 **Tails**"
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "8ball") {
+
+            const answers = [
+                "Yes.",
+                "No.",
+                "Definitely.",
+                "Probably.",
+                "Probably not.",
+                "Ask again later.",
+                "Without a doubt.",
+                "I don't think so.",
+                "Absolutely not.",
+                "The signs point to yes."
+            ];
+
+            await interaction.reply(
+                `🎱 ${randomItem(answers)}`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "choose") {
+
+            const options =
+                interaction.options
+                    .getString("options")
+                    .split(",")
+                    .map(x => x.trim())
+                    .filter(Boolean);
+
+            if (!options.length) {
+                await interaction.reply({
+                    content: "Give me at least one option.",
+                    ephemeral: true
+                });
+                return;
+            }
+
+            await interaction.reply(
+                `🎯 I choose **${randomItem(options)}**.`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "rate") {
+
+            const thing =
+                interaction.options.getString("thing");
+
+            const rating =
+                Math.floor(
+                    Math.random() * 101
+                );
+
+            await interaction.reply(
+                `⭐ I rate **${thing}** **${rating}/100**.`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "ship") {
+
+            const user1 =
+                interaction.options.getUser("user1");
+
+            const user2 =
+                interaction.options.getUser("user2");
+
+            const score =
+                Math.floor(
+                    Math.random() * 101
+                );
+
+            await interaction.reply(
+                `❤️ **${safeUserName(user1)} + ${safeUserName(user2)}** = **${score}%**`
+            );
+
+            return;
+        }
+
+        if (interaction.commandName === "announce") {
+
+            const message =
+                interaction.options.getString("message");
+
+            await interaction.channel.send({
+                embeds: [
+                    new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle("Announcement")
+                        .setDescription(message)
+                        .setFooter({
+                            text:
+                                `Posted by ${safeUserName(interaction.user)}`
+                        })
+                ]
+            });
+
+            await interaction.reply({
+                content: "Announcement sent.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        // ====================================================
+        // GEOMETRY DASH
+        // ====================================================
+
+        if (interaction.commandName === "gd") {
+
+            const subcommand =
+                interaction.options.getSubcommand();
+
+            // ------------------------------------------------
+            // LEVEL
+            // ------------------------------------------------
+
+            if (subcommand === "level") {
+
+                const id =
+                    interaction.options.getString("id");
+
+                await interaction.deferReply();
+
+                const level =
+                    await getGDLevel(id);
+
+                if (!level) {
+                    await interaction.editReply({
                         embeds: [
-                            new EmbedBuilder()
-                                .setTitle(
-                                    `${user.tag}'s Avatar`
-                                )
-                                .setImage(
-                                    avatar
-                                )
-                                .setColor(
-                                    0x5865F2
-                                )
+                            gdUnavailableEmbed()
                         ]
                     });
+                    return;
                 }
 
-                return interaction.reply({
+                await interaction.editReply({
+                    embeds: [
+                        createLevelEmbed(level)
+                    ]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // SEARCH
+            // ------------------------------------------------
+
+            if (subcommand === "search") {
+
+                const query =
+                    interaction.options.getString("query");
+
+                await interaction.deferReply();
+
+                const levels =
+                    await searchGDLevels(
+                        query,
+                        {
+                            count: 10
+                        }
+                    );
+
+                if (!levels.length) {
+                    await interaction.editReply({
+                        embeds: [
+                            gdUnavailableEmbed()
+                        ]
+                    });
+                    return;
+                }
+
+                const lines =
+                    levels
+                        .slice(0, 10)
+                        .map((level, index) => {
+
+                            const id =
+                                level.id ||
+                                level.levelID ||
+                                level.ID ||
+                                "?";
+
+                            const name =
+                                level.name ||
+                                "Unknown";
+
+                            const difficulty =
+                                difficultyName(level);
+
+                            return (
+                                `**${index + 1}.** ` +
+                                `${difficultyEmoji(difficulty)} ` +
+                                `[${truncate(name, 50)}](${levelUrl(id)}) ` +
+                                `\`${id}\``
+                            );
+                        })
+                        .join("\n");
+
+                await interaction.editReply({
                     embeds: [
                         new EmbedBuilder()
+                            .setColor(0x5865F2)
                             .setTitle(
-                                user.tag
+                                `Geometry Dash Search — ${query}`
                             )
-                            .setThumbnail(
-                                user.displayAvatarURL({
-                                    size: 512
-                                })
-                            )
-                            .setColor(
-                                0x5865F2
-                            )
-                            .addFields({
-                                name:
-                                    "User ID",
-                                value:
-                                    `\`${user.id}\``
+                            .setDescription(lines)
+                            .setFooter({
+                                text: `${levels.length} result(s)`
                             })
                     ]
                 });
+
+                return;
             }
+
+            // ------------------------------------------------
+            // RANDOM
+            // ------------------------------------------------
+
+            if (subcommand === "random") {
+
+                await interaction.deferReply();
+
+                const levels =
+                    await searchGDLevels("*", {
+                        count: 50
+                    });
+
+                if (!levels.length) {
+                    await interaction.editReply({
+                        embeds: [
+                            gdUnavailableEmbed()
+                        ]
+                    });
+                    return;
+                }
+
+                const level =
+                    randomItem(levels);
+
+                await interaction.editReply({
+                    embeds: [
+                        createLevelEmbed(
+                            level,
+                            "🎲 Random Level:"
+                        )
+                    ]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // DAILY
+            // ------------------------------------------------
+
+            if (subcommand === "daily") {
+
+                await interaction.deferReply();
+
+                const level =
+                    await getSpecialGDLevel("daily");
+
+                if (!level) {
+                    await interaction.editReply({
+                        embeds: [
+                            gdUnavailableEmbed()
+                        ]
+                    });
+                    return;
+                }
+
+                await interaction.editReply({
+                    embeds: [
+                        createLevelEmbed(
+                            level,
+                            "☀️ Daily:"
+                        )
+                    ]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // WEEKLY
+            // ------------------------------------------------
+
+            if (subcommand === "weekly") {
+
+                await interaction.deferReply();
+
+                const level =
+                    await getSpecialGDLevel("weekly");
+
+                if (!level) {
+                    await interaction.editReply({
+                        embeds: [
+                            gdUnavailableEmbed()
+                        ]
+                    });
+                    return;
+                }
+
+                await interaction.editReply({
+                    embeds: [
+                        createLevelEmbed(
+                            level,
+                            "🏆 Weekly:"
+                        )
+                    ]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // FEATURED / TRENDING / RECENT / DEMON
+            // ------------------------------------------------
 
             if (
-                name === "membercount"
+                subcommand === "featured" ||
+                subcommand === "trending" ||
+                subcommand === "recent" ||
+                subcommand === "demon"
             ) {
-                return interaction.reply(
-                    `👥 **${number(
-                        interaction.guild.memberCount
-                    )}** members`
-                );
+
+                await interaction.deferReply();
+
+                const levels =
+                    await getGDCategory(
+                        subcommand
+                    );
+
+                if (!levels.length) {
+                    await interaction.editReply({
+                        embeds: [
+                            gdUnavailableEmbed()
+                        ]
+                    });
+                    return;
+                }
+
+                const titleMap = {
+                    featured: "⭐ Featured Levels",
+                    trending: "🔥 Trending Levels",
+                    recent: "🆕 Recent Levels",
+                    demon: "😈 Demon Levels"
+                };
+
+                const lines =
+                    levels
+                        .slice(0, 15)
+                        .map((level, index) => {
+
+                            const id =
+                                level.id ||
+                                level.levelID ||
+                                level.ID ||
+                                "?";
+
+                            const name =
+                                level.name ||
+                                "Unknown";
+
+                            const difficulty =
+                                difficultyName(level);
+
+                            return (
+                                `**${index + 1}.** ` +
+                                `${difficultyEmoji(difficulty)} ` +
+                                `[${truncate(name, 45)}](${levelUrl(id)}) ` +
+                                `\`${id}\``
+                            );
+                        })
+                        .join("\n");
+
+                await interaction.editReply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(0x5865F2)
+                            .setTitle(
+                                titleMap[subcommand]
+                            )
+                            .setDescription(lines)
+                    ]
+                });
+
+                return;
             }
 
-            /* MODERATION */
+            // ------------------------------------------------
+            // PROFILE
+            // ------------------------------------------------
 
-            if (name === "clear") {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ManageMessages,
-                        "Manage Messages"
-                    )
-                ) return;
+            if (subcommand === "profile") {
 
-                const amount =
-                    interaction.options.getInteger(
-                        "amount"
+                const username =
+                    interaction.options.getString(
+                        "username"
                     );
 
-                const deleted =
-                    await interaction.channel.bulkDelete(
-                        amount,
-                        true
+                await interaction.deferReply();
+
+                const profile =
+                    await getGDProfile(username);
+
+                if (!profile) {
+                    await interaction.editReply({
+                        embeds: [
+                            gdUnavailableEmbed()
+                        ]
+                    });
+                    return;
+                }
+
+                const name =
+                    profile.username ||
+                    profile.name ||
+                    username;
+
+                const embed =
+                    new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle(
+                            `Geometry Dash Profile — ${name}`
+                        )
+                        .addFields(
+                            {
+                                name: "Stars",
+                                value: String(
+                                    profile.stars ??
+                                    profile.starCount ??
+                                    0
+                                ),
+                                inline: true
+                            },
+                            {
+                                name: "Demons",
+                                value: String(
+                                    profile.demons ??
+                                    profile.demonCount ??
+                                    0
+                                ),
+                                inline: true
+                            },
+                            {
+                                name: "Creator Points",
+                                value: String(
+                                    profile.cp ??
+                                    profile.creatorPoints ??
+                                    0
+                                ),
+                                inline: true
+                            },
+                            {
+                                name: "Diamonds",
+                                value: String(
+                                    profile.diamonds ??
+                                    0
+                                ),
+                                inline: true
+                            },
+                            {
+                                name: "Coins",
+                                value: String(
+                                    profile.coins ??
+                                    0
+                                ),
+                                inline: true
+                            },
+                            {
+                                name: "User ID",
+                                value: String(
+                                    profile.playerID ??
+                                    profile.userID ??
+                                    profile.id ??
+                                    "Unknown"
+                                ),
+                                inline: true
+                            }
+                        )
+                        .setFooter({
+                            text: "MotionBOT • Geometry Dash"
+                        });
+
+                await interaction.editReply({
+                    embeds: [embed]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // SERVER CHALLENGE
+            // ------------------------------------------------
+
+            if (subcommand === "challenge") {
+
+                const guildId =
+                    interaction.guild.id;
+
+                const challenge =
+                    data.challenges[guildId];
+
+                if (!challenge) {
+                    await interaction.reply(
+                        "No Geometry Dash challenge has been set."
+                    );
+                    return;
+                }
+
+                await interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(0x5865F2)
+                            .setTitle(
+                                "🎯 Server GD Challenge"
+                            )
+                            .setDescription(
+                                challenge
+                            )
+                    ]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // SET CHALLENGE
+            // ------------------------------------------------
+
+            if (subcommand === "setchallenge") {
+
+                const value =
+                    interaction.options.getString(
+                        "level"
                     );
 
-                return interaction.reply({
+                data.challenges[
+                    interaction.guild.id
+                ] = value;
+
+                saveData();
+
+                await interaction.reply(
+                    `🎯 Server GD challenge set to **${value}**.`
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // EVENT
+            // ------------------------------------------------
+
+            if (subcommand === "event") {
+
+                const event =
+                    data.events[
+                        interaction.guild.id
+                    ];
+
+                if (!event) {
+                    await interaction.reply(
+                        "No Geometry Dash event is currently set."
+                    );
+                    return;
+                }
+
+                await interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(0x5865F2)
+                            .setTitle(
+                                "🎪 Geometry Dash Event"
+                            )
+                            .setDescription(event)
+                    ]
+                });
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // SET EVENT
+            // ------------------------------------------------
+
+            if (subcommand === "setevent") {
+
+                const value =
+                    interaction.options.getString(
+                        "event"
+                    );
+
+                data.events[
+                    interaction.guild.id
+                ] = value;
+
+                saveData();
+
+                await interaction.reply(
+                    `🎪 Geometry Dash event set to **${value}**.`
+                );
+
+                return;
+            }
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Interaction error:",
+            error
+        );
+
+        try {
+
+            if (interaction.replied || interaction.deferred) {
+
+                await interaction.editReply({
                     content:
-                        `Deleted **${deleted.size}** messages.`,
+                        "Something went wrong while processing that command."
+                });
+
+            } else {
+
+                await interaction.reply({
+                    content:
+                        "Something went wrong while processing that command.",
                     ephemeral: true
                 });
             }
 
-            if (
-                name === "kick" ||
-                name === "ban"
-            ) {
-                const isBan =
-                    name === "ban";
-
-                const allowed =
-                    await permission(
-                        interaction,
-                        isBan
-                            ? PermissionsBitField.Flags.BanMembers
-                            : PermissionsBitField.Flags.KickMembers,
-                        isBan
-                            ? "Ban Members"
-                            : "Kick Members"
-                    );
-
-                if (!allowed) return;
-
-                const user =
-                    interaction.options.getUser(
-                        "user"
-                    );
-
-                const member =
-                    await interaction.guild.members
-                        .fetch(user.id)
-                        .catch(() => null);
-
-                if (
-                    member &&
-                    (
-                        isBan
-                            ? !member.bannable
-                            : !member.kickable
-                    )
-                ) {
-                    return interaction.reply({
-                        content:
-                            "I cannot moderate that member. Check role hierarchy.",
-                        ephemeral: true
-                    });
-                }
-
-                const reason =
-                    interaction.options.getString(
-                        "reason"
-                    ) ||
-                    "No reason provided";
-
-                if (isBan) {
-                    await interaction.guild.members.ban(
-                        user.id,
-                        {
-                            reason
-                        }
-                    );
-                } else {
-                    await member.kick(
-                        reason
-                    );
-                }
-
-                return interaction.reply(
-                    `${isBan ? "🔨 Banned" : "👢 Kicked"} **${user.tag}**\nReason: ${reason}`
-                );
-            }
-
-            if (name === "unban") {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .BanMembers,
-                        "Ban Members"
-                    )
-                ) return;
-
-                const id =
-                    interaction.options.getString(
-                        "userid"
-                    );
-
-                await interaction.guild.members.unban(
-                    id
-                );
-
-                return interaction.reply(
-                    `Unbanned **${id}**.`
-                );
-            }
-
-            if (
-                name === "timeout" ||
-                name === "untimeout"
-            ) {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ModerateMembers,
-                        "Moderate Members"
-                    )
-                ) return;
-
-                const user =
-                    interaction.options.getUser(
-                        "user"
-                    );
-
-                const member =
-                    await interaction.guild.members
-                        .fetch(user.id)
-                        .catch(() => null);
-
-                if (!member) {
-                    return interaction.reply({
-                        content:
-                            "Member not found.",
-                        ephemeral: true
-                    });
-                }
-
-                if (
-                    name === "untimeout"
-                ) {
-                    await member.timeout(
-                        null
-                    );
-
-                    return interaction.reply(
-                        `Removed timeout from **${user.tag}**.`
-                    );
-                }
-
-                const minutes =
-                    interaction.options.getInteger(
-                        "minutes"
-                    );
-
-                await member.timeout(
-                    minutes * 60000,
-                    `Timeout by ${interaction.user.tag}`
-                );
-
-                return interaction.reply(
-                    `⏱️ Timed out **${user.tag}** for **${minutes} minutes**.`
-                );
-            }
-
-            if (
-                name === "warn"
-            ) {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ModerateMembers,
-                        "Moderate Members"
-                    )
-                ) return;
-
-                const user =
-                    interaction.options.getUser(
-                        "user"
-                    );
-
-                const reason =
-                    interaction.options.getString(
-                        "reason"
-                    );
-
-                const key =
-                    `${interaction.guild.id}:${user.id}`;
-
-                if (
-                    !data.warnings[key]
-                ) {
-                    data.warnings[key] =
-                        [];
-                }
-
-                data.warnings[key].push({
-                    reason,
-                    moderator:
-                        interaction.user.id,
-                    time:
-                        Date.now()
-                });
-
-                saveData();
-
-                return interaction.reply(
-                    `⚠️ Warned **${user.tag}**.\nReason: ${reason}`
-                );
-            }
-
-            if (
-                name === "warnings"
-            ) {
-                const user =
-                    interaction.options.getUser(
-                        "user"
-                    ) ||
-                    interaction.user;
-
-                const key =
-                    `${interaction.guild.id}:${user.id}`;
-
-                const warnings =
-                    data.warnings[key] ||
-                    [];
-
-                if (!warnings.length) {
-                    return interaction.reply(
-                        `**${user.tag}** has no warnings.`
-                    );
-                }
-
-                const text =
-                    warnings
-                        .slice(-10)
-                        .map(
-                            (w, i) =>
-                                `**${i + 1}.** ${w.reason}\n` +
-                                `Moderator: <@${w.moderator}>`
-                        )
-                        .join(
-                            "\n\n"
-                        );
-
-                return interaction.reply({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setTitle(
-                                `Warnings • ${user.tag}`
-                            )
-                            .setDescription(
-                                text
-                            )
-                            .setColor(
-                                0xF1C40F
-                            )
-                    ]
-                });
-            }
-
-            if (
-                name === "slowmode"
-            ) {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ManageChannels,
-                        "Manage Channels"
-                    )
-                ) return;
-
-                const seconds =
-                    interaction.options.getInteger(
-                        "seconds"
-                    );
-
-                await interaction.channel.setRateLimitPerUser(
-                    seconds
-                );
-
-                return interaction.reply(
-                    seconds
-                        ? `Slowmode: **${seconds}s**`
-                        : "Slowmode disabled."
-                );
-            }
-
-            if (
-                name === "lock" ||
-                name === "unlock"
-            ) {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ManageChannels,
-                        "Manage Channels"
-                    )
-                ) return;
-
-                await interaction.channel.permissionOverwrites.edit(
-                    interaction.guild.roles.everyone,
-                    {
-                        SendMessages:
-                            name === "lock"
-                                ? false
-                                : null
-                    }
-                );
-
-                return interaction.reply(
-                    name === "lock"
-                        ? "🔒 Channel locked."
-                        : "🔓 Channel unlocked."
-                );
-            }
-
-            /* FUN */
-
-            if (
-                name === "roll"
-            ) {
-                const max =
-                    interaction.options.getInteger(
-                        "max"
-                    ) ||
-                    100;
-
-                return interaction.reply(
-                    `🎲 **${Math.floor(
-                        Math.random() * max
-                    ) + 1} / ${max}**`
-                );
-            }
-
-            if (
-                name === "coinflip"
-            ) {
-                return interaction.reply(
-                    Math.random() < 0.5
-                        ? "🪙 **Heads!**"
-                        : "🪙 **Tails!**"
-                );
-            }
-
-            if (
-                name === "8ball"
-            ) {
-                const answers = [
-                    "Absolutely.",
-                    "Definitely.",
-                    "Most likely.",
-                    "Probably.",
-                    "Maybe.",
-                    "Ask again later.",
-                    "Probably not.",
-                    "No.",
-                    "Absolutely not."
-                ];
-
-                return interaction.reply(
-                    `🎱 ${
-                        answers[
-                            Math.floor(
-                                Math.random() *
-                                answers.length
-                            )
-                        ]
-                    }`
-                );
-            }
-
-            if (
-                name === "choose"
-            ) {
-                const choices =
-                    interaction.options
-                        .getString(
-                            "options"
-                        )
-                        .split(",")
-                        .map(
-                            x => x.trim()
-                        )
-                        .filter(Boolean);
-
-                if (
-                    choices.length < 2
-                ) {
-                    return interaction.reply({
-                        content:
-                            "Provide at least two choices separated by commas.",
-                        ephemeral: true
-                    });
-                }
-
-                return interaction.reply(
-                    `🎯 **${
-                        choices[
-                            Math.floor(
-                                Math.random() *
-                                choices.length
-                            )
-                        ]
-                    }**`
-                );
-            }
-
-            if (
-                name === "rate"
-            ) {
-                const thing =
-                    interaction.options.getString(
-                        "thing"
-                    );
-
-                return interaction.reply(
-                    `📊 **${thing}** — **${
-                        Math.floor(
-                            Math.random() * 101
-                        )
-                    }/100**`
-                );
-            }
-
-            if (
-                name === "ship"
-            ) {
-                const a =
-                    interaction.options.getUser(
-                        "user1"
-                    );
-
-                const b =
-                    interaction.options.getUser(
-                        "user2"
-                    );
-
-                const hash =
-                    (
-                        BigInt(a.id) +
-                        BigInt(b.id)
-                    ) %
-                    101n;
-
-                return interaction.reply(
-                    `💞 **${a.username} × ${b.username}**\nCompatibility: **${hash}%**`
-                );
-            }
-
-            if (
-                name === "poll"
-            ) {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ManageMessages,
-                        "Manage Messages"
-                    )
-                ) return;
-
-                const question =
-                    interaction.options.getString(
-                        "question"
-                    );
-
-                const row =
-                    new ActionRowBuilder()
-                        .addComponents(
-                            new ButtonBuilder()
-                                .setCustomId(
-                                    "poll_yes"
-                                )
-                                .setLabel(
-                                    "Yes"
-                                )
-                                .setStyle(
-                                    ButtonStyle.Success
-                                ),
-                            new ButtonBuilder()
-                                .setCustomId(
-                                    "poll_no"
-                                )
-                                .setLabel(
-                                    "No"
-                                )
-                                .setStyle(
-                                    ButtonStyle.Danger
-                                )
-                        );
-
-                return interaction.reply({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setTitle(
-                                "📊 Poll"
-                            )
-                            .setDescription(
-                                question
-                            )
-                            .setColor(
-                                0x5865F2
-                            )
-                    ],
-                    components: [
-                        row
-                    ]
-                });
-            }
-
-            if (
-                name === "announce"
-            ) {
-                if (
-                    !await permission(
-                        interaction,
-                        PermissionsBitField
-                            .Flags
-                            .ManageMessages,
-                        "Manage Messages"
-                    )
-                ) return;
-
-                const message =
-                    interaction.options.getString(
-                        "message"
-                    );
-
-                return interaction.reply({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setTitle(
-                                "Announcement"
-                            )
-                            .setDescription(
-                                message
-                            )
-                            .setColor(
-                                0x5865F2
-                            )
-                    ]
-                });
-            }
-
-            /* =====================
-               GEOMETRY DASH
-            ===================== */
-
-            if (
-                name === "gd"
-            ) {
-                const sub =
-                    interaction.options.getSubcommand();
-
-                if (
-                    sub === "level"
-                ) {
-                    const id =
-                        interaction.options.getString(
-                            "id"
-                        );
-
-                    const level =
-                        await gdFetch(
-                            `/level/${encodeURIComponent(id)}`
-                        );
-
-                    if (!level) {
-                        return interaction.reply({
-                            content:
-                                "Level not found.",
-                            ephemeral: true
-                        });
-                    }
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "search"
-                ) {
-                    const query =
-                        interaction.options.getString(
-                            "query"
-                        );
-
-                    const results =
-                        await gdFetch(
-                            `/search/${encodeURIComponent(query)}?count=10`
-                        );
-
-                    if (
-                        !Array.isArray(
-                            results
-                        ) ||
-                        !results.length
-                    ) {
-                        return interaction.reply(
-                            "No levels found."
-                        );
-                    }
-
-                    const list =
-                        results
-                            .slice(0, 10)
-                            .map(
-                                (level, i) =>
-                                    `**${i + 1}. [${level.name}](https://gdbrowser.com/${level.id})**\n` +
-                                    `${level.difficulty || "Unknown"} • ` +
-                                    `${level.length || "Unknown"} • ` +
-                                    `⭐ ${number(level.stars)}`
-                            )
-                            .join(
-                                "\n\n"
-                            );
-
-                    return interaction.reply({
-                        embeds: [
-                            new EmbedBuilder()
-                                .setTitle(
-                                    `🔎 ${query}`
-                                )
-                                .setDescription(
-                                    list
-                                )
-                                .setColor(
-                                    0x5865F2
-                                )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "daily" ||
-                    sub === "weekly"
-                ) {
-                    const endpoint =
-                        sub === "daily"
-                            ? "/level/daily"
-                            : "/level/weekly";
-
-                    const level =
-                        await gdFetch(
-                            endpoint
-                        );
-
-                    if (!level) {
-                        return interaction.reply(
-                            "Couldn't load the current level."
-                        );
-                    }
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level,
-                                sub === "daily"
-                                    ? "☀️ Daily Level"
-                                    : "📅 Weekly Demon"
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "featured" ||
-                    sub === "trending" ||
-                    sub === "recent"
-                ) {
-                    const endpoint =
-                        sub === "featured"
-                            ? "/search/*?type=featured&count=30"
-                            : sub === "trending"
-                                ? "/search/*?type=trending&count=30"
-                                : "/search/*?type=recent&count=30";
-
-                    const results =
-                        await gdFetch(
-                            endpoint
-                        );
-
-                    if (
-                        !Array.isArray(
-                            results
-                        ) ||
-                        !results.length
-                    ) {
-                        return interaction.reply(
-                            "Couldn't load GD levels."
-                        );
-                    }
-
-                    const level =
-                        results[
-                            Math.floor(
-                                Math.random() *
-                                results.length
-                            )
-                        ];
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level,
-                                sub === "featured"
-                                    ? "⭐ Random Featured"
-                                    : sub === "trending"
-                                        ? "🔥 Random Trending"
-                                        : "🆕 Random Recent"
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "random" ||
-                    sub === "demon"
-                ) {
-                    const difficulty =
-                        interaction.options.getString(
-                            "difficulty"
-                        );
-
-                    let endpoint =
-                        "/search/*?count=50";
-
-                    if (
-                        sub === "demon" ||
-                        difficulty === "demon"
-                    ) {
-                        endpoint =
-                            "/search/*?diff=-2&count=50";
-                    } else if (
-                        difficulty &&
-                        difficulty !== "any"
-                    ) {
-                        const map = {
-                            easy: 1,
-                            normal: 2,
-                            hard: 3,
-                            harder: 4,
-                            insane: 5
-                        };
-
-                        if (
-                            map[difficulty]
-                        ) {
-                            endpoint +=
-                                `&diff=${map[difficulty]}`;
-                        }
-                    }
-
-                    const results =
-                        await gdFetch(
-                            endpoint
-                        );
-
-                    if (
-                        !Array.isArray(
-                            results
-                        ) ||
-                        !results.length
-                    ) {
-                        return interaction.reply(
-                            "Couldn't generate a level."
-                        );
-                    }
-
-                    const level =
-                        results[
-                            Math.floor(
-                                Math.random() *
-                                results.length
-                            )
-                        ];
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level,
-                                sub === "demon"
-                                    ? "👹 Random Demon"
-                                    : "🎲 Random GD Level"
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "profile"
-                ) {
-                    const username =
-                        interaction.options.getString(
-                            "username"
-                        );
-
-                    const profile =
-                        await gdFetch(
-                            `/profile/${encodeURIComponent(username)}`
-                        );
-
-                    if (!profile) {
-                        return interaction.reply(
-                            "GD profile not found."
-                        );
-                    }
-
-                    return interaction.reply({
-                        embeds: [
-                            new EmbedBuilder()
-                                .setTitle(
-                                    `👤 ${profile.username}`
-                                )
-                                .setColor(
-                                    0x5865F2
-                                )
-                                .addFields(
-                                    {
-                                        name:
-                                            "Stars",
-                                        value:
-                                            number(profile.stars),
-                                        inline: true
-                                    },
-                                    {
-                                        name:
-                                            "Diamonds",
-                                        value:
-                                            number(profile.diamonds),
-                                        inline: true
-                                    },
-                                    {
-                                        name:
-                                            "Demons",
-                                        value:
-                                            number(profile.demons),
-                                        inline: true
-                                    },
-                                    {
-                                        name:
-                                            "User Coins",
-                                        value:
-                                            number(profile.userCoins),
-                                        inline: true
-                                    },
-                                    {
-                                        name:
-                                            "Creator Points",
-                                        value:
-                                            number(profile.cp),
-                                        inline: true
-                                    }
-                                )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "setevent"
-                ) {
-                    if (
-                        !await permission(
-                            interaction,
-                            PermissionsBitField
-                                .Flags
-                                .ManageGuild,
-                            "Manage Server"
-                        )
-                    ) return;
-
-                    const id =
-                        interaction.options.getString(
-                            "id"
-                        );
-
-                    const level =
-                        await gdFetch(
-                            `/level/${encodeURIComponent(id)}`
-                        );
-
-                    if (!level) {
-                        return interaction.reply({
-                            content:
-                                "That level doesn't exist.",
-                            ephemeral: true
-                        });
-                    }
-
-                    getServer(
-                        interaction.guild.id
-                    ).eventLevel =
-                        level.id;
-
-                    saveData();
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level,
-                                "🎉 Event Level Set"
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "event"
-                ) {
-                    const server =
-                        getServer(
-                            interaction.guild.id
-                        );
-
-                    if (
-                        !server.eventLevel
-                    ) {
-                        return interaction.reply(
-                            "No Event Level has been configured."
-                        );
-                    }
-
-                    const level =
-                        await gdFetch(
-                            `/level/${server.eventLevel}`
-                        );
-
-                    if (!level) {
-                        return interaction.reply(
-                            "The Event Level could not be loaded."
-                        );
-                    }
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level,
-                                "🎉 Server Event Level"
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "setchallenge"
-                ) {
-                    if (
-                        !await permission(
-                            interaction,
-                            PermissionsBitField
-                                .Flags
-                                .ManageGuild,
-                            "Manage Server"
-                        )
-                    ) return;
-
-                    const id =
-                        interaction.options.getString(
-                            "id"
-                        );
-
-                    const level =
-                        await gdFetch(
-                            `/level/${encodeURIComponent(id)}`
-                        );
-
-                    if (!level) {
-                        return interaction.reply({
-                            content:
-                                "That level doesn't exist.",
-                            ephemeral: true
-                        });
-                    }
-
-                    data.challenges[
-                        interaction.guild.id
-                    ] = {
-                        level:
-                            level.id,
-                        setter:
-                            interaction.user.id,
-                        time:
-                            Date.now()
-                    };
-
-                    saveData();
-
-                    return interaction.reply({
-                        embeds: [
-                            levelEmbed(
-                                level,
-                                "🎮 GD Challenge Set"
-                            )
-                        ]
-                    });
-                }
-
-                if (
-                    sub === "challenge"
-                ) {
-                    const challenge =
-                        data.challenges[
-                            interaction.guild.id
-                        ];
-
-                    if (!challenge) {
-                        return interaction.reply(
-                            "This server doesn't have a GD challenge yet."
-                        );
-                    }
-
-                    const level =
-                        await gdFetch(
-                            `/level/${challenge.level}`
-                        );
-
-                    if (!level) {
-                        return interaction.reply(
-                            "The challenge level couldn't be loaded."
-                        );
-                    }
-
-                    const embed =
-                        levelEmbed(
-                            level,
-                            "🎮 Current GD Challenge"
-                        );
-
-                    embed.addFields({
-                        name:
-                            "Objective",
-                        value:
-                            "Beat the level and post your completion in the server."
-                    });
-
-                    return interaction.reply({
-                        embeds: [
-                            embed
-                        ]
-                    });
-                }
-            }
-
-        } catch (error) {
-            console.error(
-                "Command error:",
-                error
-            );
-
-            const response = {
-                content:
-                    "Something went wrong.",
-                ephemeral: true
-            };
-
-            if (
-                interaction.replied ||
-                interaction.deferred
-            ) {
-                return interaction
-                    .followUp(response)
-                    .catch(() => {});
-            }
-
-            return interaction
-                .reply(response)
-                .catch(() => {});
+        } catch {
+            // Ignore secondary Discord errors.
         }
     }
-);
+});
 
-/* =========================
-   BUTTONS
-========================= */
+// ============================================================
+// ERROR HANDLING
+// ============================================================
 
-client.on(
-    "interactionCreate",
-    async interaction => {
+process.on("unhandledRejection", error => {
+    console.error(
+        "Unhandled promise rejection:",
+        error
+    );
+});
 
-        if (
-            !interaction.isButton()
-        ) return;
+process.on("uncaughtException", error => {
+    console.error(
+        "Uncaught exception:",
+        error
+    );
+});
 
-        if (
-            interaction.customId ===
-            "poll_yes"
-        ) {
-            return interaction.reply({
-                content:
-                    "You voted **Yes**.",
-                ephemeral: true
-            });
-        }
+// ============================================================
+// START
+// ============================================================
 
-        if (
-            interaction.customId ===
-            "poll_no"
-        ) {
-            return interaction.reply({
-                content:
-                    "You voted **No**.",
-                ephemeral: true
-            });
-        }
-    }
-);
-
-/* =========================
-   ERROR PROTECTION
-========================= */
-
-process.on(
-    "unhandledRejection",
-    error => {
-        console.error(
-            "Unhandled rejection:",
-            error
-        );
-    }
-);
-
-process.on(
-    "uncaughtException",
-    error => {
-        console.error(
-            "Uncaught exception:",
-            error
-        );
-    }
-);
-
-client.on(
-    "error",
-    error => {
-        console.error(
-            "Discord error:",
-            error
-        );
-    }
-);
-
-client.on(
-    "shardError",
-    error => {
-        console.error(
-            "Shard error:",
-            error
-        );
-    }
-);
-
-/* =========================
-   START
-========================= */
-
-(async () => {
-    try {
-        console.log(
-            "Starting MotionBOT..."
-        );
-
-        await registerCommands();
-
-        await client.login(
-            TOKEN
-        );
-
-    } catch (error) {
-        console.error(
-            "Startup error:",
-            error
-        );
-
-        process.exit(1);
-    }
-})();
+client.login(TOKEN);
